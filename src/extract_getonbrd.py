@@ -2,9 +2,7 @@
 """Extractor multi-fuente de empleos (GetOnBrd + Remotive).
 
 Genera:
-- JSON/CSV unificado
-- muestra representativa de 50 registros
-- metadata de ejecucion
+- un unico JSON crudo combinado con la respuesta de ambas APIs
 
 No requiere dependencias externas (solo libreria estandar).
 """
@@ -21,6 +19,7 @@ import re
 import time
 import unicodedata
 from collections import Counter, defaultdict
+from http.client import IncompleteRead
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 from urllib.error import HTTPError, URLError
@@ -142,10 +141,18 @@ def solicitar_json_url(
             with urlopen(solicitud, timeout=30) as respuesta:
                 carga = respuesta.read().decode("utf-8")
             return json.loads(carga)
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+        except IncompleteRead as exc:
+            # Algunos servidores cierran antes de completar Content-Length.
+            # Si el payload parcial es JSON valido, se usa; si no, se reintenta.
+            try:
+                return json.loads(exc.partial.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                ultimo_error = exc
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
             ultimo_error = exc
-            if intento < reintentos:
-                time.sleep(1.2 * intento)
+
+        if intento < reintentos:
+            time.sleep(1.2 * intento)
 
     raise RuntimeError(f"No fue posible consultar {url_final}: {ultimo_error}")
 
@@ -610,7 +617,6 @@ def normalizar_empleo_remotive(
 
 def extraer_empleos_getonbrd(
     argumentos: argparse.Namespace,
-    patrones_habilidades: Dict[str, List[re.Pattern[str]]],
 ) -> Dict[str, Any]:
     contexto_consulta = {
         "country_code": argumentos.codigo_pais,
@@ -618,15 +624,11 @@ def extraer_empleos_getonbrd(
         "remote": argumentos.remoto or "",
     }
 
-    modalidades = obtener_catalogo("modalities", pausa_request=argumentos.pausa_request)
-    seniorities = obtener_catalogo("seniorities", pausa_request=argumentos.pausa_request)
-
     pagina_actual = 1
     total_paginas = 1
     paginas_descargadas = 0
     paginas_brutas: List[Dict[str, Any]] = []
-    registros: List[Dict[str, Any]] = []
-    resolvedor_empresa = ResolvedorEmpresa(pausa_request=argumentos.pausa_request)
+    empleos_crudos: List[Dict[str, Any]] = []
 
     while pagina_actual <= total_paginas:
         if argumentos.max_paginas and pagina_actual > argumentos.max_paginas:
@@ -647,39 +649,28 @@ def extraer_empleos_getonbrd(
         total_paginas = int(meta.get("total_pages", total_paginas) or total_paginas)
         empleos_pagina = carga.get("data", [])
 
-        for empleo in empleos_pagina:
-            if isinstance(empleo, dict):
-                registros.append(
-                    normalizar_empleo_getonbrd(
-                        empleo=empleo,
-                        contexto_consulta=contexto_consulta,
-                        modalidades=modalidades,
-                        seniorities=seniorities,
-                        resolvedor_empresa=resolvedor_empresa,
-                        patrones_habilidades=patrones_habilidades,
-                    )
-                )
+        empleos_crudos.extend(
+            empleo for empleo in empleos_pagina if isinstance(empleo, dict)
+        )
 
         print(
-            f"  - GetOnBrd pagina {pagina_actual} procesada | registros acumulados: {len(registros)}"
+            f"  - GetOnBrd pagina {pagina_actual} procesada | registros acumulados: {len(empleos_crudos)}"
         )
         pagina_actual += 1
         if argumentos.pausa_request > 0:
             time.sleep(argumentos.pausa_request)
 
     return {
-        "records": registros,
+        "jobs_raw": empleos_crudos,
         "raw_pages": paginas_brutas,
         "query_context": contexto_consulta,
         "pages_downloaded": paginas_descargadas,
         "total_pages_available": total_paginas,
-        "companies_resolved": resolvedor_empresa.conteo_consultas,
     }
 
 
 def extraer_empleos_remotive(
     argumentos: argparse.Namespace,
-    patrones_habilidades: Dict[str, List[re.Pattern[str]]],
 ) -> Dict[str, Any]:
     parametros = {
         "limit": argumentos.limite_remotive,
@@ -687,19 +678,14 @@ def extraer_empleos_remotive(
     }
     carga = solicitar_json_url(URL_REMOTIVE, parametros=parametros)
 
-    empleos = carga.get("jobs", [])
-    registros = [
-        normalizar_empleo_remotive(
-            empleo,
-            consulta_global=argumentos.consulta,
-            patrones_habilidades=patrones_habilidades,
-        )
-        for empleo in empleos
+    empleos_crudos = [
+        empleo
+        for empleo in carga.get("jobs", [])
         if isinstance(empleo, dict)
     ]
 
     return {
-        "records": registros,
+        "jobs_raw": empleos_crudos,
         "raw_payload": carga,
         "job_count_reported": carga.get("job-count"),
         "total_job_count_reported": carga.get("total-job-count"),
@@ -792,7 +778,7 @@ def escribir_csv(ruta: Path, filas: List[Dict[str, Any]]) -> None:
 
 def analizar_argumentos() -> argparse.Namespace:
     analizador = argparse.ArgumentParser(
-        description="Extrae empleos desde GetOnBrd y Remotive y genera un dataset normalizado."
+        description="Extrae payloads crudos desde GetOnBrd y Remotive y los combina en un unico JSON."
     )
     analizador.add_argument(
         "--codigo-pais",
@@ -841,22 +827,6 @@ def analizar_argumentos() -> argparse.Namespace:
         help="Cantidad maxima de empleos a solicitar en Remotive.",
     )
     analizador.add_argument(
-        "--tamano-muestra",
-        "--sample-size",
-        dest="tamano_muestra",
-        type=int,
-        default=50,
-        help="Tamano de muestra representativa.",
-    )
-    analizador.add_argument(
-        "--semilla",
-        "--seed",
-        dest="semilla",
-        type=int,
-        default=42,
-        help="Semilla para muestra reproducible.",
-    )
-    analizador.add_argument(
         "--pausa-request",
         "--request-delay",
         dest="pausa_request",
@@ -871,106 +841,64 @@ def analizar_argumentos() -> argparse.Namespace:
         default="data",
         help="Directorio base de salida.",
     )
-    analizador.add_argument(
-        "--catalogo-habilidades",
-        "--skills-catalog",
-        dest="catalogo_habilidades",
-        default=None,
-        help="Ruta a JSON opcional para extender habilidades: {habilidad: [aliases...]}",
-    )
     return analizador.parse_args()
 
 
 def principal() -> None:
     argumentos = analizar_argumentos()
 
-    alias_habilidades = cargar_alias_habilidades(argumentos.catalogo_habilidades)
-    patrones_habilidades = compilar_patrones_habilidades(alias_habilidades)
+    print("[1/4] Extrayendo GetOnBrd (sin normalizacion)...")
+    getonbrd = extraer_empleos_getonbrd(argumentos)
 
-    print("[1/6] Extrayendo GetOnBrd...")
-    getonbrd = extraer_empleos_getonbrd(argumentos, patrones_habilidades)
+    print("[2/4] Extrayendo Remotive (sin normalizacion)...")
+    remotive = extraer_empleos_remotive(argumentos)
 
-    print("[2/6] Extrayendo Remotive...")
-    remotive = extraer_empleos_remotive(argumentos, patrones_habilidades)
-
-    print("[3/6] Unificando y deduplicando registros...")
-    registros_combinados = deduplicar_registros(getonbrd["records"] + remotive["records"])
-
-    if not registros_combinados:
+    total_getonbrd = len(getonbrd["jobs_raw"])
+    total_remotive = len(remotive["jobs_raw"])
+    total_combinado = total_getonbrd + total_remotive
+    if total_combinado == 0:
         raise SystemExit("No se encontraron registros en ninguna fuente con los filtros indicados.")
 
-    conteos = Counter([str(fila.get("source_platform", "unknown")) for fila in registros_combinados])
-
-    print("[4/6] Generando muestra representativa...")
-    tamano_muestra = min(argumentos.tamano_muestra, len(registros_combinados))
-    muestra = construir_muestra_representativa(registros_combinados, tamano_muestra, argumentos.semilla)
-
-    print("[5/6] Escribiendo archivos de salida...")
-    raiz_salida = Path(argumentos.directorio_salida)
-    ruta_bruta_getonbrd = raiz_salida / "raw" / "getonbrd_jobs_raw_pages.json"
-    ruta_bruta_remotive = raiz_salida / "raw" / "remotive_jobs_raw.json"
-    ruta_dataset_json = raiz_salida / "processed" / "jobs_multisource_dataset.json"
-    ruta_dataset_csv = raiz_salida / "processed" / "jobs_multisource_dataset.csv"
-    ruta_muestra_json = raiz_salida / "samples" / f"jobs_multisource_sample_{tamano_muestra}.json"
-    ruta_muestra_csv = raiz_salida / "samples" / f"jobs_multisource_sample_{tamano_muestra}.csv"
-    ruta_metadata = raiz_salida / "processed" / "extraction_metadata.json"
-
-    escribir_json(ruta_bruta_getonbrd, getonbrd["raw_pages"])
-    escribir_json(ruta_bruta_remotive, remotive["raw_payload"])
-    escribir_json(ruta_dataset_json, registros_combinados)
-    escribir_csv(ruta_dataset_csv, registros_combinados)
-    escribir_json(ruta_muestra_json, muestra)
-    escribir_csv(ruta_muestra_csv, muestra)
-
-    metadatos = {
+    print("[3/4] Combinando payloads crudos en un unico JSON...")
+    salida_combinada = {
         "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "sources": [
-            {
-                "platform": "GetOnBrd",
-                "base_url": URL_BASE_GETONBRD,
-                "endpoint": "/search/jobs",
-                "query": getonbrd["query_context"],
-                "pages_downloaded": getonbrd["pages_downloaded"],
-                "total_pages_available": getonbrd["total_pages_available"],
-                "companies_resolved": getonbrd["companies_resolved"],
-                "records": len(getonbrd["records"]),
+        "filters": {
+            "getonbrd": getonbrd["query_context"],
+            "remotive": {
+                "search": argumentos.consulta,
+                "limit": argumentos.limite_remotive,
             },
-            {
-                "platform": "Remotive",
-                "base_url": URL_REMOTIVE,
-                "endpoint": "/remote-jobs",
-                "query": {
-                    "search": argumentos.consulta,
-                    "limit": argumentos.limite_remotive,
-                },
-                "job_count_reported": remotive["job_count_reported"],
-                "total_job_count_reported": remotive["total_job_count_reported"],
-                "records": len(remotive["records"]),
-            },
-        ],
-        "records_total": len(registros_combinados),
-        "records_by_source": dict(conteos),
-        "sample_size": tamano_muestra,
-        "skills_catalog": {
-            "custom_file": argumentos.catalogo_habilidades,
-            "skills_count": len(alias_habilidades),
         },
-        "files": {
-            "raw_getonbrd_json": str(ruta_bruta_getonbrd),
-            "raw_remotive_json": str(ruta_bruta_remotive),
-            "dataset_json": str(ruta_dataset_json),
-            "dataset_csv": str(ruta_dataset_csv),
-            "sample_json": str(ruta_muestra_json),
-            "sample_csv": str(ruta_muestra_csv),
+        "counts": {
+            "getonbrd_jobs": total_getonbrd,
+            "remotive_jobs": total_remotive,
+            "total_jobs": total_combinado,
+            "getonbrd_pages_downloaded": getonbrd["pages_downloaded"],
+            "getonbrd_total_pages_available": getonbrd["total_pages_available"],
+            "remotive_job_count_reported": remotive["job_count_reported"],
+            "remotive_total_job_count_reported": remotive["total_job_count_reported"],
+        },
+        "sources": {
+            "getonbrd": {
+                "endpoint": f"{URL_BASE_GETONBRD}/search/jobs",
+                "raw_pages": getonbrd["raw_pages"],
+            },
+            "remotive": {
+                "endpoint": URL_REMOTIVE,
+                "raw_payload": remotive["raw_payload"],
+            },
         },
     }
-    escribir_json(ruta_metadata, [metadatos])
 
-    print("[6/6] Proceso finalizado.")
-    print(f"  - Registros combinados: {len(registros_combinados)}")
-    for nombre_fuente, cantidad in conteos.items():
-        print(f"  - {nombre_fuente}: {cantidad}")
-    print(f"  - Muestra creada: {tamano_muestra}")
+    print("[4/4] Escribiendo archivo JSON combinado...")
+    ruta_salida = Path(argumentos.directorio_salida) / "raw" / "jobs_apis_raw_combined.json"
+    escribir_json(ruta_salida, salida_combinada)
+
+    print("Proceso finalizado.")
+    print(f"  - GetOnBrd: {total_getonbrd}")
+    print(f"  - Remotive: {total_remotive}")
+    print(f"  - Total: {total_combinado}")
+    print(f"  - Archivo generado: {ruta_salida}")
 
 
 if __name__ == "__main__":
