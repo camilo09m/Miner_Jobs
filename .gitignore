@@ -1,0 +1,3 @@
+# Ignorar artefactos de extraccion de datos
+data/**/*.json
+data/**/*.csv
